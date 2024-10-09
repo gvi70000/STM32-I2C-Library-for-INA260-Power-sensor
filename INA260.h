@@ -1,124 +1,128 @@
 #ifndef INA260_H_
 #define INA260_H_
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "stm32h7xx_hal.h"
+#include <stdint.h>
+// Datasheet link
+// https://www.ti.com/lit/ds/symlink/ina260.pdf?ts=1725866881912&ref_url=https%253A%252F%252Fwww.google.com%252F
 
-	#include <stdint.h>
-	#include "stm32h7xx_hal.h"
-	// Number of samples to collect
-	typedef enum {
-		samples_1,		// = 0 (000b) -- default
-		samples_4,		// = 1 (001b)
-		samples_16,		// = 2 (010b)
-		samples_64,		// = 3 (011b)
-		samples_128,	// = 4 (100b)
-		samples_256,	// = 5 (101b)
-		samples_512,	// = 6 (110b)
-		samples_1024,	// = 7 (111b)
-	} ina260_sample_size_t;
+// INA260 LSB constants (A, V, W, not mA, mV, mW)
+#define INA260_LSB_CURRENT    0.00125f  // 1.25 mA or 0.00125 A per LSB
+#define INA260_LSB_VOLTAGE    0.00125f  // 1.25 mV per LSB
+#define INA260_LSB_POWER      0.01f     // 10 mW per LSB
 
-	// Conversion time per sample for current and voltage
-	typedef enum {
-		time_140us,		// = 0 (000b)
-		time_204us,		// = 1 (001b)
-		time_332us,		// = 2 (010b)
-		time_588us,		// = 3 (011b)
-		time_1100us,	// = 4 (100b) -- default (voltage, current)
-		time_2116us,	// = 5 (101b)
-		time_4156us,	// = 6 (110b)
-		time_8244us,	// = 7 (111b)
-	} ina260_conversion_time_t;
+// Time conversion factor from ms to hours
+#define MS_TO_HOURS           3600000.0f
 
-	// Set measurement mode
-	typedef enum {
-		mode_Triggered,		// = 0 (000b)
-		mode_Continuous,	// = 1 (001b) -- default
-	} ina260_operating_mode_t;
+// Buffer length for I2C data
+#define BUFFER_LEN            2
 
-	// specifies which measurements are performed for each conversion. you can
-	// perform current-only, voltage-only, or both current and voltage. note the
-	// bit patterns result in the following equalities:
-	// iotShutdown	== 0
-	// iotPower		== ( iotVoltage | iotCurrent )
-	typedef enum {
-		measure_Shutdown,	// = 0 (000b)
-		measure_Current,	// = 1 (001b)
-		measure_Voltage,	// = 2 (010b)
-		measure_Power,		// = 3 (011b) -- default
-	} ina260_operating_type_t;
+// Default register configuration
+#define DEFAULT_CONFIG        0x6D27	//AVG=512, I=100, V=100, Mode=111
+#define DEFAULT_MASK          0x400		//Conversion Ready
+#define DEFAULT_MFG_ID        0x5449
+#define DEFAULT_DEV_ID        0x2270
 
-	// format of the DEVICE_ID register (FFh)
-	typedef union	{
-		uint16_t u16;
-		struct {
-			uint8_t revision :	4;
-			uint16_t device	: 12;
-		}__attribute__ ((packed));
-	} ina260_ID_t;
-	
-	typedef union {
-		uint16_t u16;
-		struct {
-			uint8_t  alert_latch_enable : 1; //  0
-      uint8_t      alert_polarity : 1; //  1
-      uint8_t       math_overflow : 1; //  2
-      uint8_t    conversion_ready : 1; //  3
-      uint8_t alert_function_flag : 1; //  4
-      uint8_t                resv : 5; //  5 -  9
-      uint8_t    alert_conversion : 1; // 10
-      uint8_t    alert_over_power : 1; // 11
-      uint8_t alert_under_voltage : 1; // 12
-      uint8_t  alert_over_voltage : 1; // 13
-      uint8_t alert_under_current : 1; // 14
-      uint8_t  alert_over_current : 1; // 15
-  }__attribute__ ((packed));
-} ina260_mask_enable_t;
+// INA260 I2C address (7-bit, shifted)
+#define INA260_I2C_ADDRESS    (0x40 << 1)
 
-// format of CONFIGURATION register (00h)
+// Timeout for I2C operations in milliseconds
+#define TIMEOUT_MS            100
+
+// INA260 register addresses
+#define INA260_REG_CONFIG     0x00
+#define INA260_REG_CURRENT    0x01
+#define INA260_REG_VOLTAGE    0x02
+#define INA260_REG_POWER      0x03
+#define INA260_REG_MASK_EN    0x06
+#define INA260_REG_ALRT_LIMIT 0x07
+#define INA260_REG_MFG_ID     0xFE
+#define INA260_REG_DEV_ID     0xFF
+
+// Conversion time options for current and voltage measurements
+typedef enum {
+    INA260_TIME_140_us   = 0,
+    INA260_TIME_204_us   = 1,
+    INA260_TIME_332_us   = 2,
+    INA260_TIME_588_us   = 3,
+    INA260_TIME_1_1_ms   = 4,
+    INA260_TIME_2_116_ms = 5,
+    INA260_TIME_4_156_ms = 6,
+    INA260_TIME_8_244_ms = 7,
+} INA260_ConversionTime;
+
+// Averaging count options for INA260
+typedef enum {
+    INA260_AVG_1     = 0,
+    INA260_AVG_4     = 1,
+    INA260_AVG_16    = 2,
+    INA260_AVG_64    = 3,
+    INA260_AVG_128   = 4,
+    INA260_AVG_256   = 5,
+    INA260_AVG_512   = 6,
+    INA260_AVG_1024  = 7,
+} INA260_AveragingCount;
+
+// Operating modes for the INA260
+typedef enum {
+    INA260_MODE_POWERDOWN               = 0,
+    INA260_MODE_CURRENT_TRIGGERED       = 1,
+    INA260_MODE_VOLTAGE_TRIGGERED       = 2,
+    INA260_MODE_CURRENT_VOLTAGE_TRIGGERED = 3,
+    INA260_MODE_CURRENT_CONTINUOUS      = 5,
+    INA260_MODE_VOLTAGE_CONTINUOUS      = 6,
+    INA260_MODE_CURRENT_VOLTAGE_CONTINUOUS = 7,
+} INA260_Mode;
+
+// Configuration register (0x00) structure
 typedef union {
-		uint16_t u16;
-		struct {
-			ina260_operating_type_t   type : 2; //  0 -  1
-			ina260_operating_mode_t   mode : 1; //  2
-			ina260_conversion_time_t ctime : 3; //  3 -  5
-			ina260_conversion_time_t vtime : 3; //  6 -  8
-			ina260_sample_size_t     ssize : 3; //  9 - 11
-			uint8_t                   resv : 3; // 12 - 14
-			uint8_t                  reset : 1; // 15
-  }__attribute__ ((packed));
-} ina260_configuration_t;
+    uint16_t Value;
+    struct __attribute__((packed)){
+        INA260_Mode            MODE : 3;
+        INA260_ConversionTime  ISHCT : 3;
+        INA260_ConversionTime  VBUSCT : 3;
+        INA260_AveragingCount  AVG : 3;
+        uint16_t RESERVED : 3;
+        uint16_t RST : 1;
+    } BitField;
+} INA260_Config;
 
-	typedef HAL_StatusTypeDef ina260_status_t;
-	#define DEFAULT_CONF	0x6127
-	#define BUFFER_LEN   	2
+// Mask/Enable register (0x06) structure
+typedef union {
+    uint16_t Value;
+    struct __attribute__((packed)){
+        uint16_t LATCH_EN : 1;
+        uint16_t APOL : 1;
+        uint16_t MATH_OVERFLOW : 1;
+        uint16_t CONVERSION_READY_EN : 1;
+        uint16_t ALERT_FLAG : 1;
+        uint16_t RESERVED : 5;
+        uint16_t CONVERSION_READY : 1;
+        uint16_t POWER_OVER_LIMIT : 1;
+        uint16_t UNDER_VOLTAGE : 1;
+        uint16_t OVER_VOLTAGE : 1;
+        uint16_t UNDER_CURRENT : 1;
+        uint16_t OVER_CURRENT : 1;
+    } BitField;
+} INA260_Mask;
 
-	// 7-bit I2C addresses see Table 2 in datasheet
-	#define INA_ADDR		(0x40 << 1)
-	// Check 8.5.3.3.1 High-Speed I2C Mode in datasheet
-	#define INA_FastMode	0x08
+// Function prototypes
+HAL_StatusTypeDef INA260_Init(void);
+HAL_StatusTypeDef INA260_Start_HighSpeed_Mode(void);
+HAL_StatusTypeDef INA260_Reset(void);
+HAL_StatusTypeDef INA260_GetConfig(INA260_Config *config);
+HAL_StatusTypeDef INA260_SetConfig(INA260_Config *config);
+HAL_StatusTypeDef INA260_GetCurrent(float *current_A);
+HAL_StatusTypeDef INA260_GetVoltage(float *voltage_V);
+HAL_StatusTypeDef INA260_GetPower(float *power_W);
+HAL_StatusTypeDef INA260_GetMaskEnable(INA260_Mask *mask);
+HAL_StatusTypeDef INA260_SetMaskEnable(INA260_Mask *mask);
+HAL_StatusTypeDef INA260_GetAlertLimit(uint16_t *limit);
+HAL_StatusTypeDef INA260_SetAlertLimit(uint16_t limit);
+HAL_StatusTypeDef INA260_GetManufacturerID(uint16_t *id);
+HAL_StatusTypeDef INA260_GetDieID(uint16_t *die_id);
+HAL_StatusTypeDef INA260_MeasureEnergy(float power_W, float *energy_Wh);
+void INA260_HandleInterrupt(float *measurements);
 
-	ina260_status_t ina260_ready(void);
-	ina260_status_t ina260_wait_until_ready(uint32_t timeout);
-	ina260_status_t ina260_set_config(ina260_operating_type_t operating_type, ina260_operating_mode_t operating_mode, ina260_conversion_time_t current_ctime, ina260_conversion_time_t voltage_ctime, ina260_sample_size_t sample_size);
-	ina260_status_t ina260_start(void);
-	ina260_status_t ina260_set_operating_type(ina260_operating_type_t operating_type);
-	ina260_status_t ina260_set_operating_mode(ina260_operating_mode_t operating_mode);
-	ina260_status_t ina260_set_conversion_time(ina260_conversion_time_t time);
-	ina260_status_t ina260_set_current_conversion_time(ina260_conversion_time_t time);
-	ina260_status_t ina260_set_voltage_conversion_time(ina260_conversion_time_t time);
-	ina260_status_t ina260_set_sample_size(ina260_sample_size_t sample_size);
-	ina260_status_t ina260_reset(uint8_t init);
-	ina260_status_t ina260_conversion_ready(void);
-	ina260_status_t ina260_conversion_start(void);
-	ina260_status_t ina260_get_current(float *current);
-	ina260_status_t ina260_get_voltage(float *voltage);
-	ina260_status_t ina260_get_power(float *power);
-	ina260_status_t ina260_get_reg(uint8_t reg, uint16_t *conf);
-	ina260_status_t ina260_set_int(void);
-#ifdef __cplusplus
-}
-#endif
-
+	
 #endif /* INA260_H_ */

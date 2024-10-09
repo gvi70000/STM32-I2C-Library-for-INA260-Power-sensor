@@ -1,264 +1,222 @@
-#include "INA260.h"
+#include "ina260.h"
 #include "i2c.h"
-#include <stdio.h>
+#include <string.h>
 
-// convert value at addr to little-endian (16-bit)
-#define byteSwap(x) ((x << 8) | (x >> 8))
-/* --- PRINTF_BYTE_TO_BINARY macro's --- */
-#define PRINTF_BINARY_SEPARATOR
-#define PRINTF_BINARY_PATTERN_INT8 "%c%c%c%c%c%c%c%c"
-#define PRINTF_BYTE_TO_BINARY_INT8(i)    \
-    (((i) & 0x80ll) ? '1' : '0'), \
-    (((i) & 0x40ll) ? '1' : '0'), \
-    (((i) & 0x20ll) ? '1' : '0'), \
-    (((i) & 0x10ll) ? '1' : '0'), \
-    (((i) & 0x08ll) ? '1' : '0'), \
-    (((i) & 0x04ll) ? '1' : '0'), \
-    (((i) & 0x02ll) ? '1' : '0'), \
-    (((i) & 0x01ll) ? '1' : '0')
-#define PRINTF_BINARY_PATTERN_INT16 \
-    PRINTF_BINARY_PATTERN_INT8               PRINTF_BINARY_SEPARATOR              PRINTF_BINARY_PATTERN_INT8
-#define PRINTF_BYTE_TO_BINARY_INT16(i) \
-    PRINTF_BYTE_TO_BINARY_INT8((i) >> 8),   PRINTF_BYTE_TO_BINARY_INT8(i)
-#define PRINTF_BINARY_PATTERN_INT32 \
-    PRINTF_BINARY_PATTERN_INT16              PRINTF_BINARY_SEPARATOR              PRINTF_BINARY_PATTERN_INT16
-#define PRINTF_BYTE_TO_BINARY_INT32(i) \
-    PRINTF_BYTE_TO_BINARY_INT16((i) >> 16), PRINTF_BYTE_TO_BINARY_INT16(i)
-#define PRINTF_BINARY_PATTERN_INT64    \
-    PRINTF_BINARY_PATTERN_INT32              PRINTF_BINARY_SEPARATOR              PRINTF_BINARY_PATTERN_INT32
-#define PRINTF_BYTE_TO_BINARY_INT64(i) \
-    PRINTF_BYTE_TO_BINARY_INT32((i) >> 32), PRINTF_BYTE_TO_BINARY_INT32(i)
-/* --- end macros --- */
+// Track energy consumption
+static uint32_t start_time_ms;
+static float total_energy_Wh = 0.0f;
+static INA260_Config myConfig = {.Value = DEFAULT_CONFIG};
+static INA260_Mask myMask = {.Value = DEFAULT_MASK};
 
-static uint16_t const TIMEOUT_MS = 500;
+// Buffers for DMA or regular I2C usage
+extern uint8_t txBuffer[TX_LEN] __ATTR_DMA_BUFFER;
+extern uint8_t rxBuffer[RX_LEN] __ATTR_DMA_BUFFER;
 
-// INA260 register addresses
-static uint8_t const INA260_REG_CONFIG  = 0x00;
-static uint8_t const INA260_REG_CURRENT = 0x01;
-static uint8_t const INA260_REG_VOLTAGE = 0x02;
-static uint8_t const INA260_REG_POWER   = 0x03;
-static uint8_t const INA260_REG_MASK_EN = 0x06;
-static uint8_t const INA260_REG_ALRTLIM = 0x07;
-static uint8_t const INA260_REG_MFG_ID  = 0xFE;
-static uint8_t const INA260_REG_DEV_ID  = 0xFF;
+// Helper function to write a 16-bit register (MSB first)
+static HAL_StatusTypeDef write_register(uint8_t reg, uint16_t value) {
+    // Send MSB first, followed by LSB
+    txBuffer[0] = (uint8_t)(value >> 8);  // MSB
+    txBuffer[1] = (uint8_t)(value & 0xFF);  // LSB
 
-// INA260 register LSB values for A, V, W, not mA, MV, mW 
-// Same for voltage and current
-static float const INA260_LSB_CV	=  0.00125F; //1.25F;
-static float const INA260_LSB_POWER	= 0.01F; //10.00F;
-
-static ina260_configuration_t config, newConf;
-
-// -- pre-defined device ID per datasheet */
-static ina260_ID_t const INA260_DEVICE_ID = {
-    .revision = 0x00,
-    .device   = 0x227
-};
-
-static ina260_status_t ina260_i2c_read(uint8_t mem_addr, uint16_t *buff_dst);
-static ina260_status_t ina260_write_config(void);
-static ina260_status_t ina260_read_mask_enable(ina260_mask_enable_t *mask_en);
-
-ina260_status_t ina260_ready(void) {
-	ina260_ID_t id;
-	ina260_status_t status = ina260_i2c_read(INA260_REG_DEV_ID, &(id.u16));
-	if (status != HAL_OK){
-		return status; }
-	// INA260 returns MSB first
-	id.u16 = byteSwap(id.u16);
-	if (INA260_DEVICE_ID.u16 != id.u16) {
-		return HAL_ERROR; }
-	return HAL_OK;
+#ifdef I2C_USE_DMA
+    // Use DMA for writing
+    return I2C_DMA_Write_MEM(INA260_I2C_ADDRESS, reg, txBuffer, BUFFER_LEN);
+#else
+    // Use regular I2C for writing
+    return HAL_I2C_Mem_Write(&hi2c1, INA260_I2C_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, txBuffer, BUFFER_LEN, TIMEOUT_MS);
+#endif
 }
 
-ina260_status_t ina260_wait_until_ready(uint32_t timeout) {
-	uint32_t start = HAL_GetTick();
-	while (ina260_ready() != HAL_OK) {
-			if (((HAL_GetTick() - start) > timeout)) {
-				return HAL_TIMEOUT;
-			}
-	}
-	return HAL_OK;
+// Helper function to read a 16-bit register (MSB first)
+static HAL_StatusTypeDef read_register(uint8_t reg, uint16_t *value) {
+    HAL_StatusTypeDef status;
+
+#ifdef INA260_USE_DMA
+    // Use DMA for reading
+    status = I2C_DMA_Read_MEM((uint16_t)INA260_I2C_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT);
+#else
+    // Use regular I2C for reading
+    status = HAL_I2C_Mem_Read(&hi2c1, INA260_I2C_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, rxBuffer, BUFFER_LEN, TIMEOUT_MS);
+#endif
+
+    if (status == HAL_OK) {
+        // Reconstruct the 16-bit value (MSB first)
+        *value = (rxBuffer[0] << 8) | rxBuffer[1];  // MSB first, then LSB
+    }
+
+    return status;
 }
 
-ina260_status_t ina260_set_config(ina260_operating_type_t operating_type, ina260_operating_mode_t operating_mode, ina260_conversion_time_t current_ctime, ina260_conversion_time_t voltage_ctime, ina260_sample_size_t sample_size) {
-	config.type = operating_type;
-	config.mode  = operating_mode;
-	config.ctime  = current_ctime;
-	config.vtime  = voltage_ctime;
-	config.ssize  = sample_size;
-	return ina260_write_config();
+// Initialize INA260
+HAL_StatusTypeDef INA260_Init(void) {
+    uint16_t mfg_id, dev_id;
+    HAL_StatusTypeDef status;
+
+    // Check manufacturer and device IDs
+    status = INA260_GetManufacturerID(&mfg_id);
+    if (status != HAL_OK || mfg_id != DEFAULT_MFG_ID) return HAL_ERROR;
+
+    status = INA260_GetDieID(&dev_id);
+    if (status != HAL_OK || dev_id != DEFAULT_DEV_ID) return HAL_ERROR;
+
+    // Reset the device
+    INA260_Reset();
+    //INA260_Start_HighSpeed_Mode();
+    // Set default configuration (continuous current and voltage measurement)
+    status = INA260_SetConfig(&myConfig);
+    if (status != HAL_OK) return HAL_ERROR;
+
+    // Set mask/enable configuration
+    status = INA260_SetMaskEnable(&myMask);
+    if (status != HAL_OK) return HAL_ERROR;
+
+    // Read back the configuration to ensure it is set correctly
+    status = INA260_GetConfig(&myConfig);
+    status = INA260_GetMaskEnable(&myMask);
+    return status;
 }
 
-ina260_status_t ina260_start(void) {
-	config.u16  = DEFAULT_CONF;
-	ina260_ID_t id;
-	//Initiate High speed - see 8.5.3.3.1 High-Speed I2C Mode in datasheet
-	HAL_I2C_Master_Transmit(&hi2c1, INA_ADDR, (uint8_t *)INA_FastMode, 1, TIMEOUT_MS);
-	HAL_Delay(1);
-	if (ina260_i2c_read(INA260_REG_DEV_ID, &(id.u16)) != HAL_OK){
-		return HAL_ERROR;
-	} else {
-		id.u16 = byteSwap(id.u16);
-		if (INA260_DEVICE_ID.u16 != id.u16){
-			return HAL_ERROR;
-		}
-	}
-	ina260_write_config();
-	return HAL_OK;
+// Reset INA260
+HAL_StatusTypeDef INA260_Reset(void) {
+    // Set the reset bit (RST)
+    myConfig.BitField.RST = 1;
+
+    // Write the configuration back to trigger the reset
+    HAL_StatusTypeDef status = INA260_SetConfig(&myConfig);
+    if (status != HAL_OK) {
+        return status;  // Return error if writing configuration fails
+    }
+
+    // Reset the reset bit (RST)
+    myConfig.BitField.RST = 0;
+    HAL_Delay(10);  // 10ms delay (may adjust based on your timing needs)
+
+    // INA260 should now be reset to default values
+    return HAL_OK;
 }
 
-ina260_status_t ina260_set_operating_type(ina260_operating_type_t operating_type) {
-	config.type = operating_type;
-	return ina260_write_config();
+HAL_StatusTypeDef INA260_Start_HighSpeed_Mode(void) {
+    HAL_StatusTypeDef status;
+    uint8_t hs_master_code = 0x08 << 1;  // High-speed master code (00001000 << 1) for write
+
+#ifdef INA260_USE_DMA
+    // Step 1: Send start condition and high-speed master code in fast mode (max 400 kHz)
+    status = I2C_DMA_Write_MEM(INA260_I2C_ADDRESS, hs_master_code, I2C_MEMADD_SIZE_8BIT, 0);
+#else
+    // Step 1: Send start condition and high-speed master code in fast mode (max 400 kHz)
+    status = HAL_I2C_Master_Transmit(&hi2c1, hs_master_code, NULL, 0, HAL_MAX_DELAY);
+#endif
+
+    if (status != HAL_OK) {
+        return status;  // Return if sending the high-speed master code fails
+    }
+
+    // Step 2: Generate a repeated start condition to enter high-speed mode
+    // We are not sending data but transitioning the protocol into high-speed mode.
+#ifdef INA260_USE_DMA
+    status = I2C_DMA_Write_MEM(INA260_I2C_ADDRESS, INA260_REG_CONFIG, I2C_MEMADD_SIZE_8BIT, 0);  // Dummy write for repeated start
+#else
+    status = HAL_I2C_Master_Sequential_Transmit_IT(&hi2c1, INA260_I2C_ADDRESS, NULL, 0, I2C_FIRST_FRAME);
+#endif
+
+    if (status != HAL_OK) {
+        return status;  // Return if repeated start fails
+    }
+
+    // Now the master can communicate at high-speed (up to 2.94 MHz)
+    return HAL_OK;
 }
 
-ina260_status_t ina260_set_operating_mode(ina260_operating_mode_t operating_mode) {
-	config.mode = operating_mode;
-	return ina260_write_config();
+// Get INA260 configuration
+HAL_StatusTypeDef INA260_GetConfig(INA260_Config *config) {
+    return read_register(INA260_REG_CONFIG, &config->Value);
 }
 
-ina260_status_t ina260_set_conversion_time(ina260_conversion_time_t time) {
-	config.ctime = time;
-	config.vtime = time;
-	return ina260_write_config();
+// Set INA260 configuration
+HAL_StatusTypeDef INA260_SetConfig(INA260_Config *config) {
+    return write_register(INA260_REG_CONFIG, config->Value);
 }
 
-ina260_status_t ina260_set_current_conversion_time(ina260_conversion_time_t time) {
-	config.ctime = time;
-	return ina260_write_config();
+// Get current in amperes
+HAL_StatusTypeDef INA260_GetCurrent(float *current_A) {
+    uint16_t raw_current;
+    HAL_StatusTypeDef status = read_register(INA260_REG_CURRENT, &raw_current);
+    if (status == HAL_OK) {
+        // Handle two's complement by casting to int16_t
+        *current_A = (int16_t)raw_current * INA260_LSB_CURRENT;
+    }
+    return status;
 }
 
-ina260_status_t ina260_set_voltage_conversion_time(ina260_conversion_time_t time) {
-	config.vtime = time;
-	return ina260_write_config();
+// Get bus voltage in volts
+HAL_StatusTypeDef INA260_GetVoltage(float *voltage_V) {
+    uint16_t raw_voltage;
+    HAL_StatusTypeDef status = read_register(INA260_REG_VOLTAGE, &raw_voltage);
+    if (status == HAL_OK) {
+        // No sign bit (bit 15 is always zero), so treat as unsigned
+        *voltage_V = raw_voltage * INA260_LSB_VOLTAGE;
+    }
+    return status;
 }
 
-ina260_status_t ina260_set_sample_size(ina260_sample_size_t sample_size) {
-	config.ssize = sample_size;
-	return ina260_write_config();
+// Get power in watts
+HAL_StatusTypeDef INA260_GetPower(float *power_W) {
+    uint16_t raw_power;
+    HAL_StatusTypeDef status = read_register(INA260_REG_POWER, &raw_power);
+    if (status == HAL_OK) {
+        *power_W = (float)raw_power * INA260_LSB_POWER;
+    }
+    return status;
 }
 
-ina260_status_t ina260_reset(uint8_t init) {
-	config.reset = 1;
-	ina260_status_t status = ina260_write_config();
-	if (status != HAL_OK) {
-		return status;
-	}
-	if (init == 0U) {
-		config.u16  = DEFAULT_CONF;
-		return HAL_OK;
-	}
-	else {
-		return ina260_write_config();
-	}
+// Get Mask/Enable register
+HAL_StatusTypeDef INA260_GetMaskEnable(INA260_Mask *mask) {
+    return read_register(INA260_REG_MASK_EN, &mask->Value);
 }
 
-ina260_status_t ina260_conversion_ready(void) {
-	ina260_mask_enable_t mask_en;
-	ina260_status_t status = ina260_read_mask_enable(&mask_en);
-	if (status != HAL_OK) {
-		return status;
-	}
-	if (mask_en.conversion_ready == 0U) {
-		return HAL_BUSY;
-	} else {
-		return HAL_OK;
-	}
+// Set Mask/Enable register
+HAL_StatusTypeDef INA260_SetMaskEnable(INA260_Mask *mask) {
+    return write_register(INA260_REG_MASK_EN, mask->Value);
 }
 
-ina260_status_t ina260_conversion_start(void) {
-//	if (config.mode == mode_Continuous) {
-//		return HAL_BUSY;
-//	}
-	return ina260_write_config();
+// Get alert limit
+HAL_StatusTypeDef INA260_GetAlertLimit(uint16_t *limit) {
+    return read_register(INA260_REG_ALRT_LIMIT, limit);
 }
 
-ina260_status_t ina260_get_current(float *current) {
-	uint16_t u;
-	int16_t c, tmp;
-	ina260_status_t status = ina260_i2c_read(INA260_REG_CURRENT, &u);
-	if (status != HAL_OK) {
-		return status;
-	}
-	tmp = u;
-	tmp = byteSwap(tmp);
-	c = (int16_t)byteSwap(u);
-	*current = (float)c * INA260_LSB_CV;
-	return HAL_OK;
+// Set alert limit
+HAL_StatusTypeDef INA260_SetAlertLimit(uint16_t limit) {
+    return write_register(INA260_REG_ALRT_LIMIT, limit);
 }
 
-ina260_status_t ina260_get_voltage(float *voltage) {
-	uint16_t v;
-	ina260_status_t status = ina260_i2c_read(INA260_REG_VOLTAGE, &v);
-	if (status != HAL_OK) {
-		return status;
-	}
-	v = byteSwap(v);
-	*voltage = (float)v * INA260_LSB_CV;
-	return HAL_OK;
+// Get Manufacturer ID
+HAL_StatusTypeDef INA260_GetManufacturerID(uint16_t *id) {
+    return read_register(INA260_REG_MFG_ID, id);
 }
 
-ina260_status_t ina260_get_power(float *power) {
-	uint16_t p;
-	ina260_status_t status = ina260_i2c_read(INA260_REG_POWER, &p);
-	if (status != HAL_OK) {
-		return status;
-	}
-	p = byteSwap(p);
-	*power = (float)p * INA260_LSB_POWER;
-	return HAL_OK;
+// Get Die ID
+HAL_StatusTypeDef INA260_GetDieID(uint16_t *die_id) {
+    return read_register(INA260_REG_DEV_ID, die_id);
 }
 
-ina260_status_t ina260_get_reg(uint8_t reg, uint16_t *conf) {
-	uint16_t r = 0;
-	ina260_status_t status = ina260_i2c_read(reg, &r);
-	if (status != HAL_OK) {
-		return status;
-	}
-	*conf = byteSwap(r);
-	return HAL_OK;
+// Measure energy consumption (in watt-hours)
+HAL_StatusTypeDef INA260_MeasureEnergy(float power_W, float *energy_Wh) {
+    uint32_t current_time_ms = HAL_GetTick();
+    float time_diff_h = (current_time_ms - start_time_ms) / MS_TO_HOURS;
+
+    total_energy_Wh += power_W * time_diff_h;
+    *energy_Wh = total_energy_Wh;
+
+    start_time_ms = current_time_ms;
+    return HAL_OK;
 }
 
-ina260_status_t ina260_set_int(void) {
-	ina260_status_t status = ina260_wait_until_ready(TIMEOUT_MS);
-	uint16_t p = INA_FastMode;
-	newConf.u16 = byteSwap(p);
-	if (HAL_OK == status) {
-		//status = ina260_i2c_write(INA260_REG_CONFIG, &(config));
-		status = HAL_I2C_Mem_Write(&hi2c1, INA_ADDR, (uint16_t)INA260_REG_MASK_EN, I2C_MEMADD_SIZE_8BIT, (uint8_t *)&newConf, BUFFER_LEN, TIMEOUT_MS);
-	}
-	return status;
-}
-
-static ina260_status_t ina260_i2c_read(uint8_t mem_addr, uint16_t *buff_dst) {
-	ina260_status_t status;
-	while (HAL_BUSY == (status = HAL_I2C_Mem_Read(&hi2c1, INA_ADDR, (uint16_t)mem_addr, I2C_MEMADD_SIZE_8BIT, (uint8_t *)buff_dst, BUFFER_LEN, TIMEOUT_MS))) {
-		// should not happen, unless during IRQ routine
-		HAL_I2C_DeInit(&hi2c1);
-		HAL_I2C_Init(&hi2c1);
-	}
-	return status;
-}
-
-static ina260_status_t ina260_write_config(void) {
-	ina260_status_t status = ina260_wait_until_ready(TIMEOUT_MS);
-	//printf("Config " PRINTF_BINARY_PATTERN_INT16 "\r\n", PRINTF_BYTE_TO_BINARY_INT16(config.u16));
-	newConf.u16 = byteSwap(config.u16);
-	//printf("Con--- " PRINTF_BINARY_PATTERN_INT16 "\r\n", PRINTF_BYTE_TO_BINARY_INT16(newConf.u16));
-	if (HAL_OK == status) {
-		//status = ina260_i2c_write(INA260_REG_CONFIG, &(config));
-		status = HAL_I2C_Mem_Write(&hi2c1, INA_ADDR, (uint16_t)INA260_REG_CONFIG, I2C_MEMADD_SIZE_8BIT, (uint8_t *)&newConf, BUFFER_LEN, TIMEOUT_MS);
-	}
-	return status;
-}
-
-static ina260_status_t ina260_read_mask_enable(ina260_mask_enable_t *mask_en) {
-  ina260_mask_enable_t me;
-  ina260_status_t status = ina260_i2c_read(INA260_REG_MASK_EN, &(me.u16));
-  if (status != HAL_OK) {
-		return status;
-	}
-  mask_en->u16 = byteSwap(me.u16);
-  return HAL_OK;
+// Handle interrupt, capture current, voltage, power, and energy
+void INA260_HandleInterrupt(float *measurements) {
+    if (INA260_GetMaskEnable(&myMask) == HAL_OK && myMask.BitField.CONVERSION_READY) {
+        INA260_GetCurrent(&measurements[0]);  // Current (A)
+        INA260_GetVoltage(&measurements[1]);  // Voltage (V)
+        INA260_GetPower(&measurements[2]);    // Power (W)
+        INA260_MeasureEnergy(measurements[2], &measurements[3]);  // Energy (Wh)
+    }
 }
